@@ -22,8 +22,8 @@ mongorestore --uri="mongodb://127.0.0.1:${port}" --archive="$WORK/db.archive" --
 summary=$(grep -E 'document\(s\) restored successfully' "$WORK/restore.log" | tail -n 1)
 echo "$summary"
 
-restored=$(sed -E 's/.* ([0-9]+) document\(s\) restored successfully.*/\1/' <<< "$summary")
-failed=$(sed -E 's/.* ([0-9]+) document\(s\) failed to restore.*/\1/' <<< "$summary")
+restored=$(grep -oE '[0-9]+ document(s) restored successfully' <<< "$summary" | grep -oE '^[0-9]+' || true)
+failed=$(grep -oE '[0-9]+ document(s) failed to restore' <<< "$summary" | grep -oE '^[0-9]+' || true)
 if [ -z "$summary" ] || [ "${restored:-0}" -eq 0 ] || [ "${failed:-1}" -ne 0 ]; then
   echo "::error::Restore check failed: ${summary:-no summary from mongorestore}"
   exit 1
