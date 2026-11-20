@@ -1,0 +1,116 @@
+name: End-to-end test
+
+# Runs the action for real: a seeded MongoDB as the source, MinIO standing in for R2,
+# then downloads the backup, decrypts it and checks every document came back.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      AWS_ACCESS_KEY_ID: minio
+      AWS_SECRET_ACCESS_KEY: minio-secret
+      AWS_DEFAULT_REGION: us-east-1
+      S3_ENDPOINT: http://127.0.0.1:9000
+      BUCKET: backups
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start a source MongoDB with sample data
+        run: |
+          docker run -d --name source -p 127.0.0.1:27017:27017 mongo:8.0
+          for _ in $(seq 1 60); do docker exec source mongosh --quiet --eval 'db.runCommand({ping:1}).ok' > /dev/null 2>&1 && break; sleep 1; done
+          docker exec source mongosh --quiet shop --eval '
+            db.customers.insertMany(Array.from({ length: 250 }, (_, i) => ({ _id: i, name: "Customer " + i, plan: i % 3 ? "basic" : "pro" })));
+            db.orders.insertMany(Array.from({ length: 1000 }, (_, i) => ({ customer: i % 250, total: (i * 7) % 300, at: new Date(Date.UTC(2026, 0, 1 + (i % 28))) })));
+            db.orders.createIndex({ customer: 1, at: -1 });
+            print(db.customers.countDocuments(), db.orders.countDocuments());'
+
+      - name: Start MinIO (S3-compatible, stands in for R2)
+        run: |
+          docker run -d --name minio -p 127.0.0.1:9000:9000 \
+            -e MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" -e MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+          for _ in $(seq 1 60); do curl -fs "$S3_ENDPOINT/minio/health/ready" > /dev/null && break; sleep 1; done
+          aws --endpoint-url "$S3_ENDPOINT" s3 mb "s3://$BUCKET"
+
+      - name: Create a throwaway age key pair
+        id: key
+        run: |
+          bash scripts/install-tools.sh
+          age-keygen -o "$RUNNER_TEMP/key.txt" 2> /dev/null
+          echo "recipient=$(age-keygen -y "$RUNNER_TEMP/key.txt")" >> "$GITHUB_OUTPUT"
+
+      - name: Run the action
+        id: backup
+        uses: ./
+        with:
+          mongodb-uri: mongodb://127.0.0.1:27017/shop
+          age-recipients: ${{ steps.key.outputs.recipient }}
+          bucket: ${{ env.BUCKET }}
+          endpoint: ${{ env.S3_ENDPOINT }}
+          access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          prefix: test/
+
+      - name: Download, decrypt and restore into a fresh MongoDB
+        env:
+          KEY: ${{ steps.backup.outputs.key }}
+        run: |
+          echo "key=$KEY size=${{ steps.backup.outputs.size-bytes }} documents=${{ steps.backup.outputs.documents }}"
+          test "${{ steps.backup.outputs.documents }}" = "1250"
+          aws --endpoint-url "$S3_ENDPOINT" s3 cp "s3://$BUCKET/$KEY" backup.age --only-show-errors
+          head -c 21 backup.age | grep -q 'age-encryption.org/v1'
+          age -d -i "$RUNNER_TEMP/key.txt" -o db.archive backup.age
+          docker run -d --name target -p 127.0.0.1:27018:27017 mongo:8.0
+          for _ in $(seq 1 60); do docker exec target mongosh --quiet --eval 'db.runCommand({ping:1}).ok' > /dev/null 2>&1 && break; sleep 1; done
+          mongorestore --uri=mongodb://127.0.0.1:27018 --archive=db.archive --gzip --quiet
+          counts=$(docker exec target mongosh --quiet shop --eval 'print(db.customers.countDocuments() + "/" + db.orders.countDocuments() + "/" + db.orders.getIndexes().length)')
+          echo "restored customers/orders/indexes: $counts"
+          test "$counts" = "250/1000/2"
+
+      - name: The monthly copy is written once per month
+        run: |
+          month=$(date -u +%Y-%m)
+          first=$(aws --endpoint-url "$S3_ENDPOINT" s3api head-object --bucket "$BUCKET" --key "test/monthly/$month.archive.gz.age" --query ETag --output text)
+          echo "MONTHLY_ETAG=$first" >> "$GITHUB_ENV"
+
+      - name: Run the action again
+        uses: ./
+        with:
+          mongodb-uri: mongodb://127.0.0.1:27017/shop
+          age-recipients: ${{ steps.key.outputs.recipient }}
+          bucket: ${{ env.BUCKET }}
+          endpoint: ${{ env.S3_ENDPOINT }}
+          access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          prefix: test/
+          verify-restore: 'false'
+
+      - name: The second run kept the monthly copy and replaced the daily one
+        run: |
+          month=$(date -u +%Y-%m)
+          objects=$(aws --endpoint-url "$S3_ENDPOINT" s3 ls "s3://$BUCKET/test/" --recursive | wc -l)
+          echo "objects: $objects"
+          test "$objects" = "2"
+          now=$(aws --endpoint-url "$S3_ENDPOINT" s3api head-object --bucket "$BUCKET" --key "test/monthly/$month.archive.gz.age" --query ETag --output text)
+          test "$now" = "$MONTHLY_ETAG"
+
+      - name: A wrong key cannot decrypt the backup
+        run: |
+          age-keygen -o other.txt 2> /dev/null
+          aws --endpoint-url "$S3_ENDPOINT" s3 cp "s3://$BUCKET/test/daily/$(date -u +%Y-%m-%d).archive.gz.age" b.age --only-show-errors
+          if age -d -i other.txt -o /dev/null b.age 2> /dev/null; then echo "::error::decrypted with the wrong key"; exit 1; fi
+          echo "rejected as expected"

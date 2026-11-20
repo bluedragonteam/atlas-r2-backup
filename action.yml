@@ -1,0 +1,127 @@
+name: MongoDB encrypted backup to R2 / S3
+description: >-
+  Dump a MongoDB database (Atlas or self-hosted), prove the dump restores, encrypt it with age
+  and upload it to Cloudflare R2 or any S3-compatible bucket.
+author: Blue Dragon Team
+branding:
+  icon: archive
+  color: blue
+
+inputs:
+  mongodb-uri:
+    description: Connection string of a read-only user, with the database name in the path (…/mydb?…)
+    required: true
+  age-recipients:
+    description: One or more age public keys (age1…), separated by spaces, commas or new lines
+    required: true
+  bucket:
+    description: Bucket name
+    required: true
+  access-key-id:
+    description: S3 access key ID (for R2, from an R2 API token limited to the bucket)
+    required: true
+  secret-access-key:
+    description: S3 secret access key
+    required: true
+  r2-account-id:
+    description: Cloudflare account ID. Builds the R2 endpoint; leave empty when you set `endpoint`
+    required: false
+    default: ''
+  endpoint:
+    description: S3 endpoint URL, for buckets that are not on R2 (MinIO, Backblaze B2, AWS S3 …)
+    required: false
+    default: ''
+  prefix:
+    description: Key prefix inside the bucket, e.g. `prod/`
+    required: false
+    default: ''
+  monthly-copy:
+    description: Also keep the first backup of each month under monthly/
+    required: false
+    default: 'true'
+  verify-restore:
+    description: Restore the dump into a throwaway MongoDB before uploading, and fail if nothing restores
+    required: false
+    default: 'true'
+  mongo-image:
+    description: Docker image used for the restore check (match your server's major version)
+    required: false
+    default: mongo:8.0
+
+outputs:
+  key:
+    description: Object key of the daily backup
+    value: ${{ steps.upload.outputs.key }}
+  size-bytes:
+    description: Size of the encrypted backup in bytes
+    value: ${{ steps.upload.outputs.size }}
+  documents:
+    description: Documents restored by the restore check (empty when verify-restore is false)
+    value: ${{ steps.verify.outputs.documents }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check inputs
+      shell: bash
+      env:
+        R2_ACCOUNT_ID: ${{ inputs.r2-account-id }}
+        ENDPOINT: ${{ inputs.endpoint }}
+      run: |
+        if [ -z "$R2_ACCOUNT_ID" ] && [ -z "$ENDPOINT" ]; then
+          echo "::error::Set r2-account-id (Cloudflare R2) or endpoint (other S3-compatible storage)"
+          exit 1
+        fi
+        if [ "$(uname -s)-$(uname -m)" != "Linux-x86_64" ]; then
+          echo "::error::This action runs on Linux x64 runners (ubuntu-22.04 or ubuntu-24.04)"
+          exit 1
+        fi
+
+    - name: Install mongodump and age
+      shell: bash
+      run: bash "${{ github.action_path }}/scripts/install-tools.sh"
+
+    - name: Dump
+      shell: bash
+      env:
+        MONGODB_URI: ${{ inputs.mongodb-uri }}
+        WORK: ${{ runner.temp }}/mongo-backup
+      run: |
+        mkdir -p "$WORK"
+        mongodump --uri="$MONGODB_URI" --archive="$WORK/db.archive" --gzip
+        echo "Dump: $(stat -c %s "$WORK/db.archive") bytes"
+
+    - name: Check the dump restores
+      id: verify
+      if: inputs.verify-restore == 'true'
+      shell: bash
+      env:
+        WORK: ${{ runner.temp }}/mongo-backup
+        MONGO_IMAGE: ${{ inputs.mongo-image }}
+      run: bash "${{ github.action_path }}/scripts/verify-restore.sh"
+
+    - name: Encrypt and upload
+      id: upload
+      shell: bash
+      env:
+        WORK: ${{ runner.temp }}/mongo-backup
+        AGE_RECIPIENTS: ${{ inputs.age-recipients }}
+        BUCKET: ${{ inputs.bucket }}
+        PREFIX: ${{ inputs.prefix }}
+        MONTHLY_COPY: ${{ inputs.monthly-copy }}
+        R2_ACCOUNT_ID: ${{ inputs.r2-account-id }}
+        ENDPOINT: ${{ inputs.endpoint }}
+        AWS_ACCESS_KEY_ID: ${{ inputs.access-key-id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.secret-access-key }}
+        AWS_DEFAULT_REGION: auto
+        # R2 and most S3-compatible stores don't need the extra checksums newer AWS CLIs add by default
+        AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+        AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+      run: bash "${{ github.action_path }}/scripts/encrypt-upload.sh"
+
+    - name: Remove local copies
+      if: always()
+      shell: bash
+      env:
+        WORK: ${{ runner.temp }}/mongo-backup
+      run: rm -rf "$WORK"
