@@ -56,7 +56,7 @@ jobs:
           secret-access-key: ${{ secrets.R2_SECRET_ACCESS_KEY }}
 ```
 
-For other S3-compatible storage (AWS S3, Backblaze B2, MinIO …) set `endpoint` instead of `r2-account-id`.
+For other S3-compatible storage (AWS S3, Backblaze B2, MinIO, Garage …) set `endpoint` instead of `r2-account-id`.
 
 ### Inputs
 
@@ -109,7 +109,7 @@ to inspect a backup without touching production.
 ## Testing
 
 [`test.yml`](.github/workflows/test.yml) runs the action end to end on Ubuntu 22.04 and 24.04: it seeds a
-MongoDB with 1,250 documents and an index, uses MinIO in place of R2, then downloads the backup, decrypts
+MongoDB with 1,250 documents and an index, uses S3Mock in place of R2, then downloads the backup, decrypts
 it, restores it into a fresh MongoDB and compares counts and indexes. It also checks that a second run keeps
 the month's first copy and that a different key can't decrypt the backup.
 
